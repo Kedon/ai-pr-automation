@@ -1,0 +1,50 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum JobStatus {
+  queued
+  sent_to_codex
+  running
+  pr_opened
+  completed
+  failed
+  blocked
+}
+
+model ProjectConfig {
+  id                String   @id @default(cuid())
+  jiraProjectKey    String   @unique
+  repositoryOwner   String
+  repositoryName    String
+  defaultBaseBranch String   @default("main")
+  slackChannel      String
+  enabled           Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  jobs              AgentJob[]
+}
+
+model AgentJob {
+  id               String      @id @default(cuid())
+  jiraIssueKey     String
+  jiraIssueTitle   String
+  jiraIssueUrl     String?
+  promptTrigger    String
+  branchName       String?
+  pullRequestUrl   String?
+  summary          String?
+  status           JobStatus   @default(queued)
+  projectConfigId  String
+  projectConfig    ProjectConfig @relation(fields: [projectConfigId], references: [id], onDelete: Restrict)
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  @@index([jiraIssueKey])
+  @@index([status])
+}
