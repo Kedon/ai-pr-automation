@@ -48,6 +48,8 @@ export class ExecutionWorkspaceService {
       (await this.safeRead(join(repoDir, 'README.md'))) ??
       (await this.safeRead(join(repoDir, 'readme.md')));
 
+    await this.installProjectDependencies(repoDir, packageJson, fileList);
+
     return {
       repoDir,
       fileList,
@@ -224,6 +226,86 @@ export class ExecutionWorkspaceService {
     } catch {
       return null;
     }
+  }
+
+  private async installProjectDependencies(
+    repoDir: string,
+    packageJson: string | null,
+    fileList: string[],
+  ): Promise<void> {
+    if (!packageJson) {
+      return;
+    }
+
+    const installCommand = this.getInstallCommand(packageJson, fileList);
+    if (!installCommand) {
+      return;
+    }
+
+    const shell = process.platform === 'win32' ? 'powershell' : 'sh';
+    const args =
+      process.platform === 'win32'
+        ? ['-NoProfile', '-Command', installCommand]
+        : ['-lc', installCommand];
+
+    await execFileAsync(shell, args, {
+      cwd: repoDir,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024 * 8,
+      timeout: Number(process.env.WORKSPACE_INSTALL_TIMEOUT_MS ?? 300000),
+    }).catch((error: { stdout?: string; stderr?: string; message?: string }) => {
+      const output = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n');
+      throw new Error(
+        `Failed to install project dependencies before Codex execution.\nCommand: ${installCommand}\n${output}`.trim(),
+      );
+    });
+  }
+
+  private getInstallCommand(packageJson: string, fileList: string[]): string | null {
+    const packageManager = this.detectPackageManager(packageJson, fileList);
+
+    if (packageManager === 'pnpm') {
+      return 'pnpm install --frozen-lockfile';
+    }
+
+    if (packageManager === 'yarn') {
+      return 'yarn install --frozen-lockfile';
+    }
+
+    if (fileList.includes('package-lock.json')) {
+      return 'npm ci';
+    }
+
+    return 'npm install --no-fund --no-audit';
+  }
+
+  private detectPackageManager(packageJson: string, fileList: string[]): 'npm' | 'pnpm' | 'yarn' {
+    try {
+      const parsed = JSON.parse(packageJson) as {
+        packageManager?: string;
+      };
+      const packageManager = parsed.packageManager?.toLowerCase() ?? '';
+
+      if (packageManager.startsWith('pnpm')) {
+        return 'pnpm';
+      }
+
+      if (packageManager.startsWith('yarn')) {
+        return 'yarn';
+      }
+    } catch {
+      // ignore invalid package.json metadata
+    }
+
+    if (fileList.includes('pnpm-lock.yaml')) {
+      return 'pnpm';
+    }
+
+    if (fileList.includes('yarn.lock')) {
+      return 'yarn';
+    }
+
+    return 'npm';
   }
 
   private resolveSafePath(repoDir: string, targetPath: string): string {
