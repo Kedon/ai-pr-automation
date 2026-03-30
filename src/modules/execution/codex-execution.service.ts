@@ -19,6 +19,13 @@ interface JiraIssueExecutionContext {
   subtasks: string[];
 }
 
+interface IssueStrategyContext {
+  mode: 'architecture_replication' | 'targeted_change';
+  reasoning: string[];
+  focusHints: string[];
+  executionPlan: string[];
+}
+
 interface ValidationTracker {
   available: boolean;
   attempts: number;
@@ -30,6 +37,14 @@ interface ValidationState {
   build: ValidationTracker;
   test: ValidationTracker;
   lint: ValidationTracker;
+}
+
+interface ExecutionTrace {
+  steps: string[];
+  filesRead: string[];
+  filesWritten: string[];
+  searchQueries: string[];
+  commands: string[];
 }
 
 @Injectable()
@@ -77,9 +92,15 @@ export class CodexExecutionService implements ExecutionProvider {
     let snapshot: WorkspaceSnapshot | null = null;
     let validationState: ValidationState | null = null;
     const testsRun: string[] = [];
+    const trace = this.createTrace();
 
     try {
       const jiraIssueContext = await this.loadJiraIssueContext(job.jiraIssueUrl);
+      const issueStrategy = this.buildIssueStrategy({
+        title: job.jiraIssueTitle,
+        description: jiraIssueContext.description,
+        subtasks: jiraIssueContext.subtasks,
+      });
 
       snapshot = await this.executionWorkspaceService.prepareSnapshot({
         owner: job.projectConfig.repositoryOwner,
@@ -96,6 +117,7 @@ export class CodexExecutionService implements ExecutionProvider {
         repository: `${job.projectConfig.repositoryOwner}/${job.projectConfig.repositoryName}`,
         snapshot,
         jiraIssueContext,
+        issueStrategy,
       });
 
       const maxSteps = Number(process.env.CODEX_MAX_STEPS ?? 16);
@@ -109,6 +131,7 @@ export class CodexExecutionService implements ExecutionProvider {
       });
 
       for (let step = 1; step <= maxSteps; step += 1) {
+        this.appendTrace(trace.steps, `step ${step}: received model response`);
         const functionCalls = this.extractFunctionCalls(response);
 
         if (functionCalls.length === 0) {
@@ -117,6 +140,7 @@ export class CodexExecutionService implements ExecutionProvider {
             'If the work is done, call finish_task.',
             'If the task cannot be completed safely, call block_task.',
             'Do not reply with plain text summaries.',
+            'For architecture replication tasks, first identify the source feature files and then create the target equivalents.',
           ].join(' ');
 
           response = await client.responses.create({
@@ -134,10 +158,12 @@ export class CodexExecutionService implements ExecutionProvider {
           [];
 
         for (const call of functionCalls) {
+          this.appendTrace(trace.steps, `step ${step}: call ${call.name}`);
           const result = await this.handleFunctionCall({
             call,
             snapshot,
             testsRun,
+            trace,
             job: {
               id: job.id,
               jiraIssueKey: job.jiraIssueKey,
@@ -168,14 +194,14 @@ export class CodexExecutionService implements ExecutionProvider {
 
             await this.slackService.sendFailureSummary({
               jiraIssueKey: job.jiraIssueKey,
-              summary: result.reason,
+              summary: this.appendTraceSummary(result.reason, trace),
               slackChannel: job.projectConfig.slackChannel,
             });
 
             return {
               jobId: job.id,
               status: 'failed',
-              reason: result.reason,
+              reason: this.appendTraceSummary(result.reason, trace),
             };
           }
 
@@ -204,6 +230,10 @@ export class CodexExecutionService implements ExecutionProvider {
               call_id: call.call_id,
               output: JSON.stringify(finishResolution.payload),
             });
+            this.appendTrace(
+              trace.steps,
+              `step ${step}: validation feedback ${this.summarizeForTrace(finishResolution.payload)}`,
+            );
             continue;
           }
 
@@ -224,11 +254,17 @@ export class CodexExecutionService implements ExecutionProvider {
         });
       }
 
-      const reason = `Codex exceeded the maximum number of execution steps without finishing ${job.jiraIssueKey}.`;
+      const reason = this.appendTraceSummary(
+        `Codex exceeded the maximum number of execution steps without finishing ${job.jiraIssueKey}.`,
+        trace,
+      );
       await this.failJob(job.id, job.jiraIssueKey, job.projectConfig.slackChannel, reason);
       return { jobId: job.id, status: 'failed', reason };
     } catch (error) {
-      const reason = error instanceof Error ? error.message : 'Unknown Codex execution error.';
+      const reason = this.appendTraceSummary(
+        error instanceof Error ? error.message : 'Unknown Codex execution error.',
+        trace,
+      );
       this.logger.error(`Codex execution failed for ${job.id}: ${reason}`);
       await this.failJob(job.id, job.jiraIssueKey, job.projectConfig.slackChannel, reason);
       return {
@@ -247,6 +283,9 @@ export class CodexExecutionService implements ExecutionProvider {
       'Work only on the provided ai/ branch and never target the main branch directly.',
       'Use the available function tools to inspect the repository, edit files, and run validations.',
       'Prefer small, safe edits and verify the change with tests or build commands whenever possible.',
+      'Minimize open-ended exploration. Build a concrete plan quickly, then execute against the most likely files.',
+      'When a task says to create a new page, module, or feature based on an existing one, treat it as an architecture replication task.',
+      'For architecture replication tasks, first identify the source feature files, map them to target files, and then adapt names, types, routes, labels, and API references deliberately.',
       'When you believe the implementation is ready, call finish_task and the orchestrator will enforce final validations.',
       'If build validation fails, you will receive the error output back and you must fix the issue before calling finish_task again.',
       'Treat the Jira description and subtasks as binding implementation context.',
@@ -264,6 +303,7 @@ export class CodexExecutionService implements ExecutionProvider {
     repository: string;
     snapshot: WorkspaceSnapshot;
     jiraIssueContext: JiraIssueExecutionContext;
+    issueStrategy: IssueStrategyContext;
   }): string {
     return [
       `Issue: ${input.jiraIssueKey}`,
@@ -278,14 +318,80 @@ export class CodexExecutionService implements ExecutionProvider {
       `Repository: ${input.repository}`,
       `Base branch: ${input.snapshot.baseBranch}`,
       `Working branch: ${input.snapshot.branchName}`,
+      `Execution mode: ${input.issueStrategy.mode}`,
+      input.issueStrategy.reasoning.length
+        ? `Execution reasoning:\n- ${input.issueStrategy.reasoning.join('\n- ')}`
+        : 'Execution reasoning: none',
+      input.issueStrategy.focusHints.length
+        ? `Focus hints:\n- ${input.issueStrategy.focusHints.join('\n- ')}`
+        : 'Focus hints: none',
+      input.issueStrategy.executionPlan.length
+        ? `Suggested plan:\n- ${input.issueStrategy.executionPlan.join('\n- ')}`
+        : 'Suggested plan: none',
       `Tracked files count: ${input.snapshot.fileList.length}`,
       `Tracked file sample: ${input.snapshot.fileList.slice(0, 60).join(' | ')}`,
       input.snapshot.packageJson
         ? `package.json excerpt:\n${input.snapshot.packageJson}`
         : 'package.json excerpt: unavailable',
       input.snapshot.readme ? `README excerpt:\n${input.snapshot.readme}` : 'README excerpt: unavailable',
-      'Start by locating the exact implementation area for the requested change.',
+      input.issueStrategy.mode === 'architecture_replication'
+        ? 'Start by locating the source feature/page mentioned in the issue, enumerate its main files, and then create the target equivalents.'
+        : 'Start by locating the exact implementation area for the requested change.',
     ].join('\n\n');
+  }
+
+  private buildIssueStrategy(input: {
+    title: string;
+    description: string;
+    subtasks: string[];
+  }): IssueStrategyContext {
+    const corpus = [input.title, input.description, ...input.subtasks].join(' ').toLowerCase();
+    const replicationPattern =
+      /(mesma arquitetura|mesma estrutura|basead[oa] na|espelh|igual a|similar a|replicar|replica)/i;
+    const mode: IssueStrategyContext['mode'] = replicationPattern.test(corpus)
+      ? 'architecture_replication'
+      : 'targeted_change';
+
+    const referencedFeatures = this.extractFeatureMentions(corpus);
+    const targetFeature = this.extractTargetFeature(corpus);
+
+    if (mode === 'architecture_replication') {
+      return {
+        mode,
+        reasoning: [
+          'The issue describes a new feature/page based on an existing architecture.',
+          'Success depends on reusing the reference feature structure instead of exploring the repository broadly.',
+        ],
+        focusHints: [
+          ...(referencedFeatures.length
+            ? [`Reference features mentioned: ${referencedFeatures.join(', ')}`]
+            : []),
+          ...(targetFeature ? [`Target feature suggested by the issue: ${targetFeature}`] : []),
+          'Look for routes, page containers, form components, interfaces, service hooks, and localization/text labels that match the reference feature.',
+        ],
+        executionPlan: [
+          'Find the source feature/page mentioned in the task and inspect its route, page, components, interfaces, and service usage.',
+          'Create or adapt the equivalent target feature files with consistent naming and imports.',
+          'Update route registration, navigation links, and exports only where required for the new feature to be reachable.',
+          'Run build first and fix build failures before attempting final completion.',
+        ],
+      };
+    }
+
+    return {
+      mode,
+      reasoning: [
+        'The issue appears to target a specific change rather than replicating an entire feature.',
+      ],
+      focusHints: [
+        'Use the exact labels, component names, and screen references from the issue to avoid changing the wrong area.',
+      ],
+      executionPlan: [
+        'Locate the exact implementation area mentioned in the issue.',
+        'Make the smallest viable change that satisfies the request.',
+        'Run build first and fix any resulting errors before finishing.',
+      ],
+    };
   }
 
   private async loadJiraIssueContext(jiraIssueUrl?: string | null): Promise<JiraIssueExecutionContext> {
@@ -488,6 +594,7 @@ export class CodexExecutionService implements ExecutionProvider {
     call: { name: string; call_id: string; arguments: string };
     snapshot: WorkspaceSnapshot;
     testsRun: string[];
+    trace: ExecutionTrace;
     job: {
       id: string;
       jiraIssueKey: string;
@@ -507,6 +614,7 @@ export class CodexExecutionService implements ExecutionProvider {
       case 'list_files': {
         const path = this.requireString(args.path, 'path');
         const files = await this.executionWorkspaceService.listFiles(input.snapshot.repoDir, path);
+        this.appendTrace(input.trace.steps, `list_files ${path}`);
         return { kind: 'continue', payload: { path, files } };
       }
       case 'read_file': {
@@ -515,6 +623,7 @@ export class CodexExecutionService implements ExecutionProvider {
           input.snapshot.repoDir,
           path,
         );
+        this.appendTrace(input.trace.filesRead, path);
         return { kind: 'continue', payload: { path, content } };
       }
       case 'search_text': {
@@ -523,6 +632,7 @@ export class CodexExecutionService implements ExecutionProvider {
           input.snapshot.repoDir,
           query,
         );
+        this.appendTrace(input.trace.searchQueries, query);
         return { kind: 'continue', payload: { query, matches } };
       }
       case 'write_file': {
@@ -533,6 +643,7 @@ export class CodexExecutionService implements ExecutionProvider {
           path,
           content,
         );
+        this.appendTrace(input.trace.filesWritten, path);
         return { kind: 'continue', payload: { path, written: true } };
       }
       case 'run_command': {
@@ -542,6 +653,7 @@ export class CodexExecutionService implements ExecutionProvider {
           command,
         );
         input.testsRun.push(command);
+        this.appendTrace(input.trace.commands, command);
         return { kind: 'continue', payload: { command, output } };
       }
       case 'block_task': {
@@ -682,6 +794,19 @@ export class CodexExecutionService implements ExecutionProvider {
     }
 
     return null;
+  }
+
+  private extractFeatureMentions(corpus: string): string[] {
+    const matches = [...corpus.matchAll(/(?:pagina|página|page|modulo|m[oó]dulo|feature)\s+([a-z0-9_-]+)/gi)]
+      .map((match) => match[1]?.trim())
+      .filter((value): value is string => Boolean(value));
+
+    return [...new Set(matches)].slice(0, 5);
+  }
+
+  private extractTargetFeature(corpus: string): string | null {
+    const targetMatch = corpus.match(/(?:criar|nova|novo|adicionar)\s+(?:pagina|página|page|modulo|m[oó]dulo|feature)\s+([a-z0-9_-]+)/i);
+    return targetMatch?.[1]?.trim() ?? null;
   }
 
   private async finalizeJob(input: {
@@ -887,6 +1012,56 @@ export class CodexExecutionService implements ExecutionProvider {
         ok: false,
         output: error instanceof Error ? error.message : 'Unknown command failure.',
       };
+    }
+  }
+
+  private createTrace(): ExecutionTrace {
+    return {
+      steps: [],
+      filesRead: [],
+      filesWritten: [],
+      searchQueries: [],
+      commands: [],
+    };
+  }
+
+  private appendTrace(target: string[], entry: string): void {
+    const normalized = entry.trim();
+    if (!normalized) {
+      return;
+    }
+
+    target.push(normalized);
+    if (target.length > 10) {
+      target.splice(0, target.length - 10);
+    }
+  }
+
+  private appendTraceSummary(reason: string, trace: ExecutionTrace): string {
+    const sections = [
+      trace.steps.length ? `Recent steps: ${trace.steps.join(' -> ')}` : '',
+      trace.filesRead.length ? `Files read: ${trace.filesRead.join(', ')}` : '',
+      trace.filesWritten.length ? `Files written: ${trace.filesWritten.join(', ')}` : '',
+      trace.searchQueries.length ? `Searches: ${trace.searchQueries.join(' | ')}` : '',
+      trace.commands.length ? `Commands: ${trace.commands.join(' | ')}` : '',
+    ].filter(Boolean);
+
+    if (!sections.length) {
+      return reason;
+    }
+
+    return `${reason}\n${sections.join('\n')}`;
+  }
+
+  private summarizeForTrace(value: unknown): string {
+    if (typeof value === 'string') {
+      return value;
+    }
+
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return '[unserializable payload]';
     }
   }
 
