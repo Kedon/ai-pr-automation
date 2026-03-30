@@ -18,6 +18,10 @@ export interface WorkspaceSnapshot {
 
 @Injectable()
 export class ExecutionWorkspaceService {
+  private readonly defaultCommandTimeoutMs = Number(
+    process.env.WORKSPACE_COMMAND_TIMEOUT_MS ?? 180000,
+  );
+
   async prepareSnapshot(input: {
     owner: string;
     repo: string;
@@ -98,6 +102,7 @@ export class ExecutionWorkspaceService {
       'npm run build',
       'npm run lint',
       'npm install',
+      'npm install --save-dev @babel/plugin-proposal-private-property-in-object',
       'npx update-browserslist-db@latest',
       'git status --short',
       'git diff --stat',
@@ -107,11 +112,13 @@ export class ExecutionWorkspaceService {
       'pnpm run build',
       'pnpm run lint',
       'pnpm install',
+      'pnpm add -D @babel/plugin-proposal-private-property-in-object',
       'pnpm exec update-browserslist-db',
       'yarn test',
       'yarn build',
       'yarn lint',
       'yarn install',
+      'yarn add -D @babel/plugin-proposal-private-property-in-object',
       'yarn dlx update-browserslist-db',
     ];
 
@@ -129,6 +136,13 @@ export class ExecutionWorkspaceService {
       cwd: repoDir,
       windowsHide: true,
       maxBuffer: 1024 * 1024 * 4,
+      timeout: this.defaultCommandTimeoutMs,
+    }).catch((error: { stdout?: string; stderr?: string; message?: string; signal?: string }) => {
+      const output = [error.stdout, error.stderr, error.message].filter(Boolean).join('\n').trim();
+      const signalSuffix = error.signal ? `\nSignal: ${error.signal}` : '';
+      throw new Error(
+        `Command failed: ${normalized}\n${output || 'No command output captured.'}${signalSuffix}`.trim(),
+      );
     });
 
     return [stdout, stderr].filter(Boolean).join('\n').slice(0, 20000);
@@ -280,6 +294,30 @@ export class ExecutionWorkspaceService {
     }
 
     return 'npm install --no-fund --no-audit';
+  }
+
+  getValidationRepairCommands(packageManager: 'npm' | 'pnpm' | 'yarn'): string[] {
+    if (packageManager === 'pnpm') {
+      return [
+        'pnpm exec update-browserslist-db',
+        'pnpm install',
+        'pnpm add -D @babel/plugin-proposal-private-property-in-object',
+      ];
+    }
+
+    if (packageManager === 'yarn') {
+      return [
+        'yarn dlx update-browserslist-db',
+        'yarn install',
+        'yarn add -D @babel/plugin-proposal-private-property-in-object',
+      ];
+    }
+
+    return [
+      'npx update-browserslist-db@latest',
+      'npm install --no-fund --no-audit',
+      'npm install --save-dev @babel/plugin-proposal-private-property-in-object',
+    ];
   }
 
   private detectPackageManager(packageJson: string, fileList: string[]): 'npm' | 'pnpm' | 'yarn' {
