@@ -98,6 +98,7 @@ export class ExecutionWorkspaceService {
       'npm run build',
       'npm run lint',
       'npm install',
+      'npx update-browserslist-db@latest',
       'git status --short',
       'git diff --stat',
       'git diff --',
@@ -106,10 +107,12 @@ export class ExecutionWorkspaceService {
       'pnpm run build',
       'pnpm run lint',
       'pnpm install',
+      'pnpm exec update-browserslist-db',
       'yarn test',
       'yarn build',
       'yarn lint',
       'yarn install',
+      'yarn dlx update-browserslist-db',
     ];
 
     if (!allowedPrefixes.some((prefix) => normalized.startsWith(prefix))) {
