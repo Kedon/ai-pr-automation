@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { dirname, join, normalize, relative } from 'node:path';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, normalize, relative } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -84,6 +84,7 @@ export class ExecutionWorkspaceService {
 
   async writeWorkspaceFile(repoDir: string, filePath: string, content: string): Promise<void> {
     const absolute = this.resolveSafePath(repoDir, filePath);
+    await mkdir(dirname(absolute), { recursive: true });
     await writeFile(absolute, content, 'utf8');
   }
 
