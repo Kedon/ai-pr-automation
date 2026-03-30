@@ -15,6 +15,13 @@ export interface CreateAgentJobInput {
 export class AgentJobsService {
   constructor(private readonly prisma: PrismaService) {}
 
+  private readonly activeStatuses = [
+    JobStatus.queued,
+    JobStatus.sent_to_codex,
+    JobStatus.running,
+    JobStatus.pr_opened,
+  ];
+
   async createQueuedJob(input: CreateAgentJobInput): Promise<AgentJob> {
     return this.prisma.agentJob.create({
       data: {
@@ -52,11 +59,13 @@ export class AgentJobsService {
   }
 
   async findActiveByIssueKey(jiraIssueKey: string): Promise<AgentJob | null> {
+    await this.failStaleActiveJobs(jiraIssueKey);
+
     return this.prisma.agentJob.findFirst({
       where: {
         jiraIssueKey,
         status: {
-          in: [JobStatus.queued, JobStatus.sent_to_codex, JobStatus.running, JobStatus.pr_opened],
+          in: this.activeStatuses,
         },
       },
       orderBy: {
@@ -70,5 +79,38 @@ export class AgentJobsService {
       where: { id: jobId },
       data: { status: JobStatus.sent_to_codex },
     });
+  }
+
+  async markFailed(jobId: string, summary: string): Promise<AgentJob> {
+    return this.prisma.agentJob.update({
+      where: { id: jobId },
+      data: {
+        status: JobStatus.failed,
+        summary,
+      },
+    });
+  }
+
+  async failStaleActiveJobs(jiraIssueKey?: string): Promise<number> {
+    const timeoutMinutes = Number(process.env.AGENT_JOB_TIMEOUT_MINUTES ?? 20);
+    const staleBefore = new Date(Date.now() - timeoutMinutes * 60 * 1000);
+
+    const result = await this.prisma.agentJob.updateMany({
+      where: {
+        ...(jiraIssueKey ? { jiraIssueKey } : {}),
+        status: {
+          in: this.activeStatuses,
+        },
+        updatedAt: {
+          lt: staleBefore,
+        },
+      },
+      data: {
+        status: JobStatus.failed,
+        summary: `Execution timed out after ${timeoutMinutes} minutes without completion.`,
+      },
+    });
+
+    return result.count;
   }
 }
