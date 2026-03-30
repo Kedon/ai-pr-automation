@@ -19,6 +19,19 @@ interface JiraIssueExecutionContext {
   subtasks: string[];
 }
 
+interface ValidationTracker {
+  available: boolean;
+  attempts: number;
+  passed: boolean;
+}
+
+interface ValidationState {
+  packageManager: 'npm' | 'pnpm' | 'yarn';
+  build: ValidationTracker;
+  test: ValidationTracker;
+  lint: ValidationTracker;
+}
+
 @Injectable()
 export class CodexExecutionService implements ExecutionProvider {
   private readonly logger = new Logger(CodexExecutionService.name);
@@ -62,6 +75,7 @@ export class CodexExecutionService implements ExecutionProvider {
     });
 
     let snapshot: WorkspaceSnapshot | null = null;
+    let validationState: ValidationState | null = null;
     const testsRun: string[] = [];
 
     try {
@@ -73,6 +87,7 @@ export class CodexExecutionService implements ExecutionProvider {
         baseBranch: job.projectConfig.defaultBaseBranch,
         branchName: job.branchName ?? `ai/${job.jiraIssueKey.toLowerCase()}`,
       });
+      validationState = this.createValidationState(snapshot.packageJson, snapshot.fileList);
 
       const initialContext = this.buildInitialContext({
         jiraIssueKey: job.jiraIssueKey,
@@ -164,7 +179,11 @@ export class CodexExecutionService implements ExecutionProvider {
             };
           }
 
-          const pullRequestUrl = await this.finishJob({
+          if (!validationState) {
+            throw new Error(`Validation state was not initialized for ${job.jiraIssueKey}.`);
+          }
+
+          const finishResolution = await this.handleFinishAction({
             job: {
               id: job.id,
               jiraIssueKey: job.jiraIssueKey,
@@ -176,12 +195,22 @@ export class CodexExecutionService implements ExecutionProvider {
             snapshot,
             finish: result.finish,
             testsRun,
+            validationState,
           });
+
+          if (finishResolution.kind === 'continue') {
+            toolOutputs.push({
+              type: 'function_call_output',
+              call_id: call.call_id,
+              output: JSON.stringify(finishResolution.payload),
+            });
+            continue;
+          }
 
           return {
             jobId: job.id,
             status: 'completed',
-            pullRequestUrl,
+            pullRequestUrl: finishResolution.pullRequestUrl,
           };
         }
 
@@ -218,6 +247,8 @@ export class CodexExecutionService implements ExecutionProvider {
       'Work only on the provided ai/ branch and never target the main branch directly.',
       'Use the available function tools to inspect the repository, edit files, and run validations.',
       'Prefer small, safe edits and verify the change with tests or build commands whenever possible.',
+      'When you believe the implementation is ready, call finish_task and the orchestrator will enforce final validations.',
+      'If build validation fails, you will receive the error output back and you must fix the issue before calling finish_task again.',
       'Treat the Jira description and subtasks as binding implementation context.',
       'If the issue references a specific screen, modal, button label, or component area, you must target that exact area.',
       'If multiple files or UI elements could match and the issue does not disambiguate them sufficiently, call block_task instead of guessing.',
@@ -442,7 +473,10 @@ export class CodexExecutionService implements ExecutionProvider {
     response: OpenAI.Responses.Response,
   ): Array<{ name: string; call_id: string; arguments: string }> {
     return response.output
-      .filter((item): item is Extract<typeof item, { type: 'function_call' }> => item.type === 'function_call')
+      .filter(
+        (item): item is Extract<typeof item, { type: 'function_call' }> =>
+          item.type === 'function_call',
+      )
       .map((item) => ({
         name: item.name,
         call_id: item.call_id,
@@ -494,7 +528,11 @@ export class CodexExecutionService implements ExecutionProvider {
       case 'write_file': {
         const path = this.requireString(args.path, 'path');
         const content = this.requireString(args.content, 'content');
-        await this.executionWorkspaceService.writeWorkspaceFile(input.snapshot.repoDir, path, content);
+        await this.executionWorkspaceService.writeWorkspaceFile(
+          input.snapshot.repoDir,
+          path,
+          content,
+        );
         return { kind: 'continue', payload: { path, written: true } };
       }
       case 'run_command': {
@@ -529,7 +567,7 @@ export class CodexExecutionService implements ExecutionProvider {
     }
   }
 
-  private async finishJob(input: {
+  private async handleFinishAction(input: {
     job: {
       id: string;
       jiraIssueKey: string;
@@ -541,22 +579,132 @@ export class CodexExecutionService implements ExecutionProvider {
     snapshot: WorkspaceSnapshot;
     finish: FinishAction;
     testsRun: string[];
+    validationState: ValidationState;
+  }): Promise<
+    | { kind: 'continue'; payload: unknown }
+    | { kind: 'completed'; pullRequestUrl: string }
+  > {
+    const validationFeedback = await this.runValidationGate({
+      jiraIssueKey: input.job.jiraIssueKey,
+      snapshot: input.snapshot,
+      testsRun: input.testsRun,
+      validationState: input.validationState,
+    });
+
+    if (validationFeedback) {
+      return {
+        kind: 'continue',
+        payload: validationFeedback,
+      };
+    }
+
+    const pullRequestUrl = await this.finalizeJob(input);
+    return {
+      kind: 'completed',
+      pullRequestUrl,
+    };
+  }
+
+  private async runValidationGate(input: {
+    jiraIssueKey: string;
+    snapshot: WorkspaceSnapshot;
+    testsRun: string[];
+    validationState: ValidationState;
+  }): Promise<unknown | null> {
+    if (input.validationState.build.available && !input.validationState.build.passed) {
+      input.validationState.build.attempts += 1;
+      const buildCommand = this.getValidationCommand(input.validationState.packageManager, 'build');
+      const buildResult = await this.runValidationCommand(input.snapshot.repoDir, buildCommand);
+      input.testsRun.push(buildCommand);
+
+      if (buildResult.ok) {
+        input.validationState.build.passed = true;
+      } else if (input.validationState.build.attempts < 3) {
+        return {
+          validation_status: 'build_failed_retry',
+          command: buildCommand,
+          attempt: input.validationState.build.attempts,
+          max_attempts: 3,
+          output: buildResult.output,
+          instruction:
+            'Build failed. Inspect the error, fix the code, and call finish_task again when ready. You still have remaining build retries.',
+        };
+      } else {
+        throw new Error(
+          [
+            `Build validation failed after 3 attempts for ${input.jiraIssueKey}.`,
+            `Command: ${buildCommand}`,
+            'Output:',
+            buildResult.output,
+          ].join('\n'),
+        );
+      }
+    }
+
+    if (input.validationState.test.available && !input.validationState.test.passed) {
+      input.validationState.test.attempts += 1;
+      const testCommand = this.getValidationCommand(input.validationState.packageManager, 'test');
+      const testResult = await this.runValidationCommand(input.snapshot.repoDir, testCommand);
+      input.testsRun.push(testCommand);
+
+      if (!testResult.ok) {
+        throw new Error(
+          [
+            `Test validation failed for ${input.jiraIssueKey}.`,
+            `Command: ${testCommand}`,
+            'Output:',
+            testResult.output,
+          ].join('\n'),
+        );
+      }
+
+      input.validationState.test.passed = true;
+    }
+
+    if (input.validationState.lint.available && !input.validationState.lint.passed) {
+      input.validationState.lint.attempts += 1;
+      const lintCommand = this.getValidationCommand(input.validationState.packageManager, 'lint');
+      const lintResult = await this.runValidationCommand(input.snapshot.repoDir, lintCommand);
+      input.testsRun.push(lintCommand);
+
+      if (!lintResult.ok) {
+        throw new Error(
+          [
+            `Lint validation failed for ${input.jiraIssueKey}.`,
+            `Command: ${lintCommand}`,
+            'Output:',
+            lintResult.output,
+          ].join('\n'),
+        );
+      }
+
+      input.validationState.lint.passed = true;
+    }
+
+    return null;
+  }
+
+  private async finalizeJob(input: {
+    job: {
+      id: string;
+      jiraIssueKey: string;
+      jiraIssueTitle: string;
+      slackChannel: string;
+      repositoryOwner: string;
+      repositoryName: string;
+    };
+    snapshot: WorkspaceSnapshot;
+    finish: FinishAction;
+    testsRun: string[];
+    validationState: ValidationState;
   }): Promise<string> {
     const diff = await this.executionWorkspaceService.getGitDiff(input.snapshot.repoDir);
     const hasChanges = await this.executionWorkspaceService.hasChanges(input.snapshot.repoDir);
-    const validationCommands = this.extractValidationCommands(
-      input.finish.tests_ran?.length ? input.finish.tests_ran : input.testsRun,
-    );
+    const validationCommands = this.extractValidationCommands(input.testsRun);
 
     if (!hasChanges) {
       throw new Error(
         `Codex called finish_task for ${input.job.jiraIssueKey}, but no workspace changes were detected.`,
-      );
-    }
-
-    if (this.requiresValidation(input.snapshot.packageJson) && validationCommands.length === 0) {
-      throw new Error(
-        `Codex called finish_task for ${input.job.jiraIssueKey} without running any validation command. Run build, test, or lint before finishing.`,
       );
     }
 
@@ -568,7 +716,8 @@ export class CodexExecutionService implements ExecutionProvider {
     await this.executionWorkspaceService.commitAndPush({
       repoDir: input.snapshot.repoDir,
       branchName: input.snapshot.branchName,
-      commitMessage: input.finish.commit_message?.trim() || `feat(ai): implement ${input.job.jiraIssueKey}`,
+      commitMessage:
+        input.finish.commit_message?.trim() || `feat(ai): implement ${input.job.jiraIssueKey}`,
     });
 
     const pullRequestUrl = await this.createPullRequest({
@@ -630,9 +779,37 @@ export class CodexExecutionService implements ExecutionProvider {
     return value;
   }
 
-  private requiresValidation(packageJson: string | null): boolean {
+  private extractValidationCommands(commands: string[]): string[] {
+    return commands.filter((command) =>
+      /(^|\s)(npm|pnpm|yarn)\s+(run\s+)?(build|test|lint)\b/.test(command.trim()),
+    );
+  }
+
+  private createValidationState(packageJson: string | null, fileList: string[]): ValidationState {
+    const scripts = this.extractScripts(packageJson);
+    return {
+      packageManager: this.detectPackageManager(packageJson, fileList),
+      build: {
+        available: typeof scripts.build === 'string',
+        attempts: 0,
+        passed: false,
+      },
+      test: {
+        available: typeof scripts.test === 'string',
+        attempts: 0,
+        passed: false,
+      },
+      lint: {
+        available: typeof scripts.lint === 'string',
+        attempts: 0,
+        passed: false,
+      },
+    };
+  }
+
+  private extractScripts(packageJson: string | null): Record<string, string> {
     if (!packageJson) {
-      return false;
+      return {};
     }
 
     try {
@@ -640,17 +817,77 @@ export class CodexExecutionService implements ExecutionProvider {
         scripts?: Record<string, string>;
       };
 
-      const scripts = parsed.scripts ?? {};
-      return ['build', 'test', 'lint'].some((script) => typeof scripts[script] === 'string');
+      return parsed.scripts ?? {};
     } catch {
-      return false;
+      return {};
     }
   }
 
-  private extractValidationCommands(commands: string[]): string[] {
-    return commands.filter((command) =>
-      /(^|\s)(npm|pnpm|yarn)\s+(run\s+)?(build|test|lint)\b/.test(command.trim()),
-    );
+  private detectPackageManager(
+    packageJson: string | null,
+    fileList: string[],
+  ): 'npm' | 'pnpm' | 'yarn' {
+    if (packageJson) {
+      try {
+        const parsed = JSON.parse(packageJson) as {
+          packageManager?: string;
+        };
+        const packageManager = parsed.packageManager?.toLowerCase() ?? '';
+
+        if (packageManager.startsWith('pnpm')) {
+          return 'pnpm';
+        }
+
+        if (packageManager.startsWith('yarn')) {
+          return 'yarn';
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    if (fileList.includes('pnpm-lock.yaml')) {
+      return 'pnpm';
+    }
+
+    if (fileList.includes('yarn.lock')) {
+      return 'yarn';
+    }
+
+    return 'npm';
+  }
+
+  private getValidationCommand(
+    packageManager: 'npm' | 'pnpm' | 'yarn',
+    script: 'build' | 'test' | 'lint',
+  ): string {
+    if (packageManager === 'yarn') {
+      return `yarn ${script}`;
+    }
+
+    if (packageManager === 'pnpm') {
+      return `pnpm run ${script}`;
+    }
+
+    return `npm run ${script}`;
+  }
+
+  private async runValidationCommand(
+    repoDir: string,
+    command: string,
+  ): Promise<{ ok: boolean; output: string }> {
+    try {
+      const output = await this.executionWorkspaceService.runAllowedCommand(repoDir, command);
+      return {
+        ok: true,
+        output: output || '(command completed without output)',
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        output: error instanceof Error ? error.message : 'Unknown command failure.',
+      };
+    }
   }
 
   private async createPullRequest(input: {
