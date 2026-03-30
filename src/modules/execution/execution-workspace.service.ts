@@ -21,6 +21,7 @@ export class ExecutionWorkspaceService {
   private readonly defaultCommandTimeoutMs = Number(
     process.env.WORKSPACE_COMMAND_TIMEOUT_MS ?? 180000,
   );
+  private readonly installEnabled = process.env.WORKSPACE_INSTALL_ENABLED?.trim() === 'true';
 
   async prepareSnapshot(input: {
     owner: string;
@@ -52,7 +53,9 @@ export class ExecutionWorkspaceService {
       (await this.safeRead(join(repoDir, 'README.md'))) ??
       (await this.safeRead(join(repoDir, 'readme.md')));
 
-    await this.installProjectDependencies(repoDir, packageJson, fileList);
+    if (this.installEnabled) {
+      await this.installProjectDependencies(repoDir, packageJson, fileList);
+    }
 
     return {
       repoDir,

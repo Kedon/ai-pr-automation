@@ -70,6 +70,8 @@ interface PlanState {
 @Injectable()
 export class CodexExecutionService implements ExecutionProvider {
   private readonly logger = new Logger(CodexExecutionService.name);
+  private readonly validationMode =
+    process.env.VALIDATION_MODE?.trim().toLowerCase() || 'disabled';
 
   constructor(
     private readonly prisma: PrismaService,
@@ -129,7 +131,9 @@ export class CodexExecutionService implements ExecutionProvider {
         branchName: job.branchName ?? `ai/${job.jiraIssueKey.toLowerCase()}`,
       });
       validationState = this.createValidationState(snapshot.packageJson, snapshot.fileList);
-      await this.captureBuildBaseline(snapshot.repoDir, validationState);
+      if (this.shouldEnforceValidation()) {
+        await this.captureBuildBaseline(snapshot.repoDir, validationState);
+      }
       const referenceBlueprint = this.buildFeatureBlueprint(
         snapshot.fileList,
         issueStrategy.referenceFeature,
@@ -318,8 +322,12 @@ export class CodexExecutionService implements ExecutionProvider {
       'For architecture replication tasks, first identify the source feature files, map them to target files, and then adapt names, types, routes, labels, and API references deliberately.',
       'For architecture replication tasks, you must call submit_plan before any write_file call.',
       'Never read environment or secret files such as .env. They are irrelevant to implementation.',
-      'When you believe the implementation is ready, call finish_task and the orchestrator will enforce final validations.',
-      'If build validation fails, you will receive the error output back and you must fix the issue before calling finish_task again.',
+      this.shouldEnforceValidation()
+        ? 'When you believe the implementation is ready, call finish_task and the orchestrator will enforce final validations.'
+        : 'When you believe the implementation is ready, call finish_task after making the change and doing any validation you judge useful.',
+      this.shouldEnforceValidation()
+        ? 'If build validation fails, you will receive the error output back and you must fix the issue before calling finish_task again.'
+        : 'Validation commands are optional in this environment; prioritize completing the requested code change safely.',
       'Treat the Jira description and subtasks as binding implementation context.',
       'If the issue references a specific screen, modal, button label, or component area, you must target that exact area.',
       'If multiple files or UI elements could match and the issue does not disambiguate them sufficiently, call block_task instead of guessing.',
@@ -811,18 +819,20 @@ export class CodexExecutionService implements ExecutionProvider {
     | { kind: 'continue'; payload: unknown }
     | { kind: 'completed'; pullRequestUrl: string }
   > {
-    const validationFeedback = await this.runValidationGate({
-      jiraIssueKey: input.job.jiraIssueKey,
-      snapshot: input.snapshot,
-      testsRun: input.testsRun,
-      validationState: input.validationState,
-    });
+    if (this.shouldEnforceValidation()) {
+      const validationFeedback = await this.runValidationGate({
+        jiraIssueKey: input.job.jiraIssueKey,
+        snapshot: input.snapshot,
+        testsRun: input.testsRun,
+        validationState: input.validationState,
+      });
 
-    if (validationFeedback) {
-      return {
-        kind: 'continue',
-        payload: validationFeedback,
-      };
+      if (validationFeedback) {
+        return {
+          kind: 'continue',
+          payload: validationFeedback,
+        };
+      }
     }
 
     const pullRequestUrl = await this.finalizeJob(input);
@@ -931,6 +941,10 @@ export class CodexExecutionService implements ExecutionProvider {
     }
 
     return null;
+  }
+
+  private shouldEnforceValidation(): boolean {
+    return this.validationMode === 'strict';
   }
 
   private extractFeatureMentions(corpus: string): string[] {
