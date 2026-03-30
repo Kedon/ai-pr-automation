@@ -24,6 +24,8 @@ interface IssueStrategyContext {
   reasoning: string[];
   focusHints: string[];
   executionPlan: string[];
+  referenceFeature: string | null;
+  targetFeature: string | null;
 }
 
 interface ValidationTracker {
@@ -45,6 +47,22 @@ interface ExecutionTrace {
   filesWritten: string[];
   searchQueries: string[];
   commands: string[];
+}
+
+interface FeatureBlueprint {
+  featureName: string;
+  files: string[];
+  routeFiles: string[];
+  serviceFiles: string[];
+  interfaceFiles: string[];
+  componentFiles: string[];
+}
+
+interface PlanState {
+  submitted: boolean;
+  summary: string | null;
+  filesToCreate: string[];
+  filesToUpdate: string[];
 }
 
 @Injectable()
@@ -109,6 +127,11 @@ export class CodexExecutionService implements ExecutionProvider {
         branchName: job.branchName ?? `ai/${job.jiraIssueKey.toLowerCase()}`,
       });
       validationState = this.createValidationState(snapshot.packageJson, snapshot.fileList);
+      const referenceBlueprint = this.buildFeatureBlueprint(
+        snapshot.fileList,
+        issueStrategy.referenceFeature,
+      );
+      const planState = this.createPlanState();
 
       const initialContext = this.buildInitialContext({
         jiraIssueKey: job.jiraIssueKey,
@@ -118,6 +141,7 @@ export class CodexExecutionService implements ExecutionProvider {
         snapshot,
         jiraIssueContext,
         issueStrategy,
+        referenceBlueprint,
       });
 
       const maxSteps = Number(process.env.CODEX_MAX_STEPS ?? 16);
@@ -164,6 +188,9 @@ export class CodexExecutionService implements ExecutionProvider {
             snapshot,
             testsRun,
             trace,
+            issueStrategy,
+            referenceBlueprint,
+            planState,
             job: {
               id: job.id,
               jiraIssueKey: job.jiraIssueKey,
@@ -286,6 +313,8 @@ export class CodexExecutionService implements ExecutionProvider {
       'Minimize open-ended exploration. Build a concrete plan quickly, then execute against the most likely files.',
       'When a task says to create a new page, module, or feature based on an existing one, treat it as an architecture replication task.',
       'For architecture replication tasks, first identify the source feature files, map them to target files, and then adapt names, types, routes, labels, and API references deliberately.',
+      'For architecture replication tasks, you must call submit_plan before any write_file call.',
+      'Never read environment or secret files such as .env. They are irrelevant to implementation.',
       'When you believe the implementation is ready, call finish_task and the orchestrator will enforce final validations.',
       'If build validation fails, you will receive the error output back and you must fix the issue before calling finish_task again.',
       'Treat the Jira description and subtasks as binding implementation context.',
@@ -304,6 +333,7 @@ export class CodexExecutionService implements ExecutionProvider {
     snapshot: WorkspaceSnapshot;
     jiraIssueContext: JiraIssueExecutionContext;
     issueStrategy: IssueStrategyContext;
+    referenceBlueprint: FeatureBlueprint | null;
   }): string {
     return [
       `Issue: ${input.jiraIssueKey}`,
@@ -328,6 +358,24 @@ export class CodexExecutionService implements ExecutionProvider {
       input.issueStrategy.executionPlan.length
         ? `Suggested plan:\n- ${input.issueStrategy.executionPlan.join('\n- ')}`
         : 'Suggested plan: none',
+      input.referenceBlueprint
+        ? [
+            `Reference feature blueprint: ${input.referenceBlueprint.featureName}`,
+            `Blueprint files:\n- ${input.referenceBlueprint.files.join('\n- ')}`,
+            input.referenceBlueprint.routeFiles.length
+              ? `Route files:\n- ${input.referenceBlueprint.routeFiles.join('\n- ')}`
+              : 'Route files: none',
+            input.referenceBlueprint.serviceFiles.length
+              ? `Service files:\n- ${input.referenceBlueprint.serviceFiles.join('\n- ')}`
+              : 'Service files: none',
+            input.referenceBlueprint.interfaceFiles.length
+              ? `Interface files:\n- ${input.referenceBlueprint.interfaceFiles.join('\n- ')}`
+              : 'Interface files: none',
+            input.referenceBlueprint.componentFiles.length
+              ? `Component files:\n- ${input.referenceBlueprint.componentFiles.join('\n- ')}`
+              : 'Component files: none',
+          ].join('\n')
+        : 'Reference feature blueprint: unavailable',
       `Tracked files count: ${input.snapshot.fileList.length}`,
       `Tracked file sample: ${input.snapshot.fileList.slice(0, 60).join(' | ')}`,
       input.snapshot.packageJson
@@ -371,10 +419,13 @@ export class CodexExecutionService implements ExecutionProvider {
         ],
         executionPlan: [
           'Find the source feature/page mentioned in the task and inspect its route, page, components, interfaces, and service usage.',
+          'Submit a concise implementation plan with the target files to create or update before editing.',
           'Create or adapt the equivalent target feature files with consistent naming and imports.',
           'Update route registration, navigation links, and exports only where required for the new feature to be reachable.',
           'Run build first and fix build failures before attempting final completion.',
         ],
+        referenceFeature: referencedFeatures[0] ?? null,
+        targetFeature,
       };
     }
 
@@ -391,6 +442,8 @@ export class CodexExecutionService implements ExecutionProvider {
         'Make the smallest viable change that satisfies the request.',
         'Run build first and fix any resulting errors before finishing.',
       ],
+      referenceFeature: referencedFeatures[0] ?? null,
+      targetFeature,
     };
   }
 
@@ -527,6 +580,29 @@ export class CodexExecutionService implements ExecutionProvider {
       },
       {
         type: 'function',
+        name: 'submit_plan',
+        description:
+          'Submit the implementation plan before editing files, especially for architecture replication tasks.',
+        strict: true,
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            summary: { type: 'string' },
+            files_to_create: {
+              type: 'array',
+              items: { type: 'string' },
+            },
+            files_to_update: {
+              type: 'array',
+              items: { type: 'string' },
+            },
+          },
+          required: ['summary', 'files_to_create', 'files_to_update'],
+        },
+      },
+      {
+        type: 'function',
         name: 'run_command',
         description: 'Run an allowed validation command such as npm test, npm run build, or git diff.',
         strict: true,
@@ -595,6 +671,9 @@ export class CodexExecutionService implements ExecutionProvider {
     snapshot: WorkspaceSnapshot;
     testsRun: string[];
     trace: ExecutionTrace;
+    issueStrategy: IssueStrategyContext;
+    referenceBlueprint: FeatureBlueprint | null;
+    planState: PlanState;
     job: {
       id: string;
       jiraIssueKey: string;
@@ -619,6 +698,7 @@ export class CodexExecutionService implements ExecutionProvider {
       }
       case 'read_file': {
         const path = this.requireString(args.path, 'path');
+        this.assertSafeReadPath(path);
         const content = await this.executionWorkspaceService.readWorkspaceFile(
           input.snapshot.repoDir,
           path,
@@ -638,6 +718,19 @@ export class CodexExecutionService implements ExecutionProvider {
       case 'write_file': {
         const path = this.requireString(args.path, 'path');
         const content = this.requireString(args.content, 'content');
+        if (input.issueStrategy.mode === 'architecture_replication' && !input.planState.submitted) {
+          return {
+            kind: 'continue',
+            payload: {
+              write_blocked: true,
+              instruction:
+                'You must call submit_plan with the files to create and update before writing files for this architecture replication task.',
+              reference_feature: input.issueStrategy.referenceFeature,
+              target_feature: input.issueStrategy.targetFeature,
+              blueprint_files: input.referenceBlueprint?.files ?? [],
+            },
+          };
+        }
         await this.executionWorkspaceService.writeWorkspaceFile(
           input.snapshot.repoDir,
           path,
@@ -645,6 +738,25 @@ export class CodexExecutionService implements ExecutionProvider {
         );
         this.appendTrace(input.trace.filesWritten, path);
         return { kind: 'continue', payload: { path, written: true } };
+      }
+      case 'submit_plan': {
+        const summary = this.requireString(args.summary, 'summary');
+        const filesToCreate = this.requireStringArray(args.files_to_create, 'files_to_create');
+        const filesToUpdate = this.requireStringArray(args.files_to_update, 'files_to_update');
+        input.planState.submitted = true;
+        input.planState.summary = summary;
+        input.planState.filesToCreate = filesToCreate;
+        input.planState.filesToUpdate = filesToUpdate;
+        this.appendTrace(input.trace.steps, `plan submitted: ${summary}`);
+        return {
+          kind: 'continue',
+          payload: {
+            plan_accepted: true,
+            summary,
+            files_to_create: filesToCreate,
+            files_to_update: filesToUpdate,
+          },
+        };
       }
       case 'run_command': {
         const command = this.requireString(args.command, 'command');
@@ -802,6 +914,34 @@ export class CodexExecutionService implements ExecutionProvider {
       .filter((value): value is string => Boolean(value));
 
     return [...new Set(matches)].slice(0, 5);
+  }
+
+  private buildFeatureBlueprint(
+    fileList: string[],
+    referenceFeature: string | null,
+  ): FeatureBlueprint | null {
+    if (!referenceFeature) {
+      return null;
+    }
+
+    const escapedFeature = referenceFeature.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const featurePattern = new RegExp(`(^|/|\\\\)${escapedFeature}([./_-]|$)`, 'i');
+    const files = fileList.filter((path) => featurePattern.test(path)).slice(0, 40);
+
+    if (!files.length) {
+      return null;
+    }
+
+    return {
+      featureName: referenceFeature,
+      files,
+      routeFiles: fileList
+        .filter((path) => /src\/routes\//i.test(path))
+        .slice(0, 12),
+      serviceFiles: files.filter((path) => /service|api/i.test(path)),
+      interfaceFiles: files.filter((path) => /interface|types?/i.test(path)),
+      componentFiles: files.filter((path) => /component/i.test(path)),
+    };
   }
 
   private extractTargetFeature(corpus: string): string | null {
@@ -1023,6 +1163,22 @@ export class CodexExecutionService implements ExecutionProvider {
       searchQueries: [],
       commands: [],
     };
+  }
+
+  private createPlanState(): PlanState {
+    return {
+      submitted: false,
+      summary: null,
+      filesToCreate: [],
+      filesToUpdate: [],
+    };
+  }
+
+  private assertSafeReadPath(path: string): void {
+    const normalized = path.replace(/\\/g, '/').toLowerCase();
+    if (normalized === '.env' || normalized.startsWith('.env.') || normalized.endsWith('/.env')) {
+      throw new Error(`Reading ${path} is not allowed for Codex execution.`);
+    }
   }
 
   private appendTrace(target: string[], entry: string): void {
